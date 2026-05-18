@@ -171,11 +171,11 @@ def execute_tools(tool_calls: list, state: AgentState) -> list[ToolMessage]:
         else:
             try:
                 if tool_name == "get_document_full_content":
-                    result, doc_aggs = tool_map[tool_name].invoke(tool_args)
-                    state["references"]["doc_aggs"] = doc_aggs
+                    result, references = tool_map[tool_name].invoke(tool_args)
+                    depulicate_references(state, references)
                 elif tool_name == "search_documents":
                     result, references = tool_map[tool_name].invoke(tool_args)
-                    state["references"] = references
+                    depulicate_references(state, references)
                 else:
                     result = tool_map[tool_name].invoke(tool_args)
             except Exception as e:
@@ -212,3 +212,14 @@ def should_continue(state: AgentState) -> str:
             return "tools"
 
     return "finish"
+
+
+def depulicate_references(state: AgentState, references: dict):
+    if not state['references']['chunks'] and not state['references']['doc_aggs']:
+        state["references"] = references
+    else:
+        if any(doc["doc_id"] == references["doc_aggs"][0]["doc_id"] for doc in state['references']['doc_aggs']):
+            pass
+        else:
+            state["references"]["doc_aggs"].append(references["doc_aggs"][0])
+            state["references"]["chunks"].extend(references["chunks"])

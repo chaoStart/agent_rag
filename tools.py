@@ -144,7 +144,7 @@ def list_knowledge_bases(
             })
 
         # 如果有关键词，进行模糊匹配
-        if keyword:
+        if keyword.strip():
             candidates = _fuzzy_match(keyword, candidates, name_key="name")
 
         if not candidates:
@@ -339,7 +339,7 @@ def search_documents(query: str,
         doc_aggs = kbinfos.get("doc_aggs", [])
         references = {"chunks": chunks, "doc_aggs": doc_aggs}
         if not chunks:
-            return "未检索到相关内容。请尝试调整查询关键词或扩大检索范围。"
+            return "未检索到相关内容。请尝试调整查询关键词或扩大检索范围。", references
 
         # 格式化输出
         result_parts = []
@@ -392,12 +392,12 @@ def get_document_full_content(doc_id: str,
         # 2、查询语句
         result = es_conn.search(query_body, search_es_index)
         # print("当前的单个文档的检索结果\n", result)
-        full_text = []
+        full_text_list = []
         chunk_lists = result.body['hits']['hits']
         for item in chunk_lists:
             current_chunk = item["_source"]["content_with_weight"]
-            full_text.append(current_chunk)
-        full_text = '\n'.join(full_text)
+            full_text_list.append(current_chunk)
+        full_text = '\n'.join(full_text_list)
         # Step 1: 获取文档信息
         is_found, doc = DocumentService.get_by_id(doc_id)
         close_connection()
@@ -408,10 +408,34 @@ def get_document_full_content(doc_id: str,
         if allowed_kb_ids and doc.knowledgebase_id not in allowed_kb_ids:
             return f"文档「{doc.name}」不在当前允许访问的知识库范围内。"
 
+        # 获取当前文档的知识库名称
+        with DB.connection_context():
+            query = Knowledgebase.select().where(Knowledgebase.deflag != '1')
+            # 强制约束到允许的知识库范围
+            if allowed_kb_ids:
+                query = query.where(Knowledgebase.id.in_([doc.knowledgebase_id]))
+            kbs = list(query.dicts())
+        close_connection()
+
+        # kb_names = []
+        # for kb in kbs:
+        #     kb_names.append(kb["name"])
         doc_name = doc.name
         file_type = doc.type
 
         doc_aggs = [{"doc_id": doc_id, "doc_name": doc_name}]
+
+        # 构建references要求的chunks格式，
+        reference_chunks = []
+        for content in full_text_list:
+            reference_chunks.append({
+                "docnm_kwd": doc_name,
+                "content_with_weight": content,
+                "similarity": 1.0,
+                "kb_id": kbs[0]["id"],
+                "kb_name": kbs[0]["name"]
+            })
+        references = {"chunks": reference_chunks, "doc_aggs": doc_aggs}
         # # Step 2: 获取 MinIO 存储路径
         # bucket, file_path = DocumentService.get_storage_address(doc_id)
         # close_connection()
@@ -466,7 +490,8 @@ def get_document_full_content(doc_id: str,
             result_parts.append(
                 "[注意: 文档内容已被截断。如需了解被截断部分的内容，可使用 search_documents 针对特定问题进行精准检索。]")
 
-        return "\n".join(result_parts), doc_aggs
+        # return "\n".join(result_parts), doc_aggs
+        return "\n".join(result_parts), references
     except Exception as e:
         logging.exception("get_document_full_content error")
         return f"获取文档全文时出错: {str(e)}"
