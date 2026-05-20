@@ -2,14 +2,14 @@ import copy
 import json
 import logging
 from typing import Generator
-
+import re
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
-
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage, BaseMessage
+from typing import Dict, Any, List, Union, Tuple
 from agent.state import AgentState
 from agent.tools import ALL_TOOLS
 from agent.prompts import AGENT_SYSTEM_PROMPT
-
+from agent.utils import calculate_messages_tokens
 # 最大迭代次数
 MAX_ITERATIONS = 8
 
@@ -46,9 +46,44 @@ def create_llm(llm_model, model_config: dict) -> ChatOpenAI:
 
 def build_messages_for_llm(state: AgentState) -> list:
     """从 state 构建发送给 LLM 的消息列表。"""
-    messages = [SystemMessage(content=AGENT_SYSTEM_PROMPT)]
-    messages.extend(state["messages"])
-    return messages
+    messages: List[BaseMessage] = [SystemMessage(content=AGENT_SYSTEM_PROMPT)]
+
+    if "messages" in state and state["messages"]:
+        messages.extend(state["messages"])
+
+    if len(messages) < 2:
+        return messages
+
+    deduped: List[BaseMessage] = []
+    seen: Dict[Tuple[str, str], bool] = {}  # key: (消息类型, 内容签名)
+
+    for msg in messages:
+        msg_type = type(msg).__name__
+        content = str(getattr(msg, 'content', ''))
+
+        # 为ToolMessage生成签名（忽略tool_call_id）
+        if isinstance(msg, ToolMessage):
+            signature = (msg_type, content, str(getattr(msg, 'name', '')))
+        else:
+            # 其他类型直接用 content 作为签名
+            signature = (msg_type, content)
+
+        # 如果该签名已出现过，则跳过（去重）
+        if signature in seen:
+            continue
+
+        seen[signature] = True
+        deduped.append(msg)
+
+    # 校验上下文信息长度是否超过模型最大上下文
+    token_info = calculate_messages_tokens(deduped)
+    # 如果超过上下文限制，不回复用户
+    if token_info['total_tokens'] > 120000:   # 禁止回答
+        warning_msg = AIMessage(
+            content="查询文档长度已超出模型最大上下文，无法回复用户问题。"
+        )
+        deduped.append(warning_msg)
+    return deduped
 
 
 def agent_node_streaming(state: AgentState, llm_with_tools: ChatOpenAI) -> Generator:
@@ -171,7 +206,8 @@ def execute_tools(tool_calls: list, state: AgentState) -> list[ToolMessage]:
         else:
             try:
                 if tool_name == "get_document_full_content":
-                    result, references = tool_map[tool_name].invoke(tool_args)
+                    real_tool_args = extract_tool_params(tool_args) #对参数进行预处理，主要用于提取文档的doc_id和知识库kb_id
+                    result, references = tool_map[tool_name].invoke(real_tool_args)
                     depulicate_references(state, references)
                 elif tool_name == "search_documents":
                     result, references = tool_map[tool_name].invoke(tool_args)
@@ -223,3 +259,78 @@ def depulicate_references(state: AgentState, references: dict):
         else:
             state["references"]["doc_aggs"].append(references["doc_aggs"][0])
             state["references"]["chunks"].extend(references["chunks"])
+
+
+def extract_tool_params(data: Dict[str, Any]) -> Dict[str, Union[List[str], str]]:
+    """
+        提取 allowed_kb_ids 和 doc_id。
+        如果数据已经是规范格式，则直接返回；如果是原始复杂格式，则进行提取。
+        """
+    # 1. 先判断数据是否已经是规范格式
+    # 规范格式的特征：包含 'allowed_kb_ids' 和 'doc_id' 键，且不包含 'function' 键
+    # 如果已经是规范格式，直接返回
+    if isinstance(data, dict) and "allowed_kb_ids" in data and "doc_id" in data:
+        return {
+            "allowed_kb_ids": data["allowed_kb_ids"],
+            "doc_id": str(data["doc_id"])
+        }
+
+    result = {}
+
+    # 提取 allowed_kb_ids
+    if "allowed_kb_ids" in data:
+        result["allowed_kb_ids"] = data["allowed_kb_ids"]
+
+    # 提取 doc_id
+    doc_id = None
+    if "function" in data and isinstance(data["function"], dict):
+        args_str = data["function"].get("arguments")
+
+        if isinstance(args_str, str):
+            doc_id = parse_doc_id_from_arguments(args_str)
+
+    # 兜底：在顶层查找 doc_id
+    if not doc_id and "doc_id" in data:
+        doc_id = data["doc_id"]
+
+    if doc_id:
+        result["doc_id"] = str(doc_id)
+
+    return result
+
+
+def parse_doc_id_from_arguments(args_str: str):
+    """专门解析高度转义的 arguments 字符串"""
+    try:
+        # 1. 去除最外层引号
+        s = args_str.strip()
+        if s.startswith('"') and s.endswith('"'):
+            s = s[1:-1]
+
+        # 2. 多次替换转义字符
+        s = s.replace('\\\\', '\\')  # 先把 \\\\ 变成 \
+        s = s.replace('\\"', '"')  # 把 \" 变成 "
+        s = s.replace('\\', '')  # 最后移除剩余的单 \
+
+        # 3. 尝试 json 解析
+        parsed = json.loads(s)
+        if isinstance(parsed, dict) and "doc_id" in parsed:
+            return parsed["doc_id"]
+
+    except Exception:
+        pass
+
+    # 4. 正则兜底方案（非常可靠）
+    # 匹配各种可能的 doc_id 写法
+    patterns = [
+        r'doc_id["\s]*[:=]["\s]*([^"\'\\,}\s]+)',
+        r'"doc_id"\s*:\s*"([^"]+)"',
+        r'doc_id["\']?\s*[:=]\s*["\']?([^"\'\\,}\s]+)'
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, args_str, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+
+    return None

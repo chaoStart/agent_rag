@@ -6,7 +6,6 @@ from agent.state import AgentState
 from typing import Generator
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 from langgraph.graph import StateGraph, END
-
 from agent.state import AgentState
 from agent.nodes import create_llm, execute_tools, MAX_ITERATIONS, build_messages_for_llm
 from agent.tools import ALL_TOOLS
@@ -146,6 +145,48 @@ def run_agent_graph(llm_model: object, model_config: dict, question: str,
             else:
                 ai_message = AIMessage(content="")
 
+            TOOL_INTENT_KEYWORDS = [
+                "获取文档", "get_document_full_content", "调用", "接下来",
+            ]
+            if not ai_message.tool_calls and ai_message.content and ai_message.additional_kwargs:
+                # 检测是否有未执行的工具意图
+                has_intent = any(kw in ai_message.content for kw in TOOL_INTENT_KEYWORDS)
+                if has_intent and iteration < MAX_ITERATIONS:
+                    # 追加一条提示，强制模型调用工具
+                    nudge = HumanMessage(content=f"请直接调用对应的工具{ai_message.additional_kwargs['tool_calls'][0]['function']['name']}，不要描述你的计划。")
+                    state["messages"].append(ai_message)
+                    state["messages"].append(nudge)
+                    # 拼接工具（函数）所需要的参数和类型
+                    for tool_args in ai_message.additional_kwargs['tool_calls']:
+                        structure_tool_args = {"args": tool_args, "id": tool_args['id'], "name": tool_args['function']['name'], "type": "tool_call"}
+                        ai_message.tool_calls.append(structure_tool_args)
+                        # state["messages"].append(ai_message)
+
+                        # 若ai_message中有额外工具参数，则继续执行额外工具获取数据
+                        # # 发送工具调用参数
+                        # for tc in ai_message.tool_calls:
+                        #     # 使用 .get() 增加容错率
+                        #     tool_key = tc.get("name")
+                        #     # 使用字典的 .get() 方法，如果 key 不存在则返回默认值（这里默认返回 tool_key 本身）
+                        #     display_name = tools_names.get(tool_key, tool_key)
+                        #
+                        #     yield {
+                        #         "type": "tool_call",
+                        #         "data": {
+                        #             "tool_name": display_name,
+                        #             "args": tc["args"],
+                        #         }
+                        #     }
+                        #
+                        # tool_messages = None
+                        # for event in _execute_tools_with_heartbeat(ai_message.tool_calls, state):
+                        #     if isinstance(event, dict):  # 心跳事件
+                        #         yield event
+                        #     else:
+                        #         tool_messages = event  # 最后一次返回结果
+                        #
+                        # state["messages"].extend(tool_messages)
+                    ai_message.additional_kwargs = {}  # 应该在最后置空
             # 判断是否有工具调用
             if ai_message.tool_calls:
                 has_tool_calls = True
